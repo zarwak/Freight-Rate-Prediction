@@ -1,15 +1,19 @@
 """Phase 5 — Models, tuning, and evaluation metrics.
 
 v2 additions over the original:
-  #1 Log-target training  -> LogTargetRegressor
+  #1 Log-target training   -> LogTargetRegressor
   #2 Hyperparameter tuning -> tune_gradient_boosting()
+  #3 XGBoost                -> get_model("xgboost" / "xgboost_log")
+  #4 Sample weighting      -> fit(..., sample_weight=...)
 """
 
 import numpy as np
 import pandas as pd
+import xgboost as xgb
 from sklearn.base import BaseEstimator, RegressorMixin, clone
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score
 from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 
 # Columns that are identifiers/targets, never fed into the model as inputs.
@@ -35,9 +39,12 @@ class LogTargetRegressor(BaseEstimator, RegressorMixin):
     def __init__(self, base_estimator):
         self.base_estimator = base_estimator
 
-    def fit(self, X, y):
+    def fit(self, X, y, sample_weight=None):
         self.base_estimator_ = clone(self.base_estimator)
-        self.base_estimator_.fit(X, np.log1p(y))
+        if sample_weight is None:
+            self.base_estimator_.fit(X, np.log1p(y))
+        else:
+            self.base_estimator_.fit(X, np.log1p(y), sample_weight=sample_weight)
         return self
 
     def predict(self, X):
@@ -64,7 +71,27 @@ def get_model(name: str, params: dict | None = None):
     if name == "gradient_boosting_log":
         base = GradientBoostingRegressor(random_state=42, **(params or {}))
         return LogTargetRegressor(base)
+    if name == "xgboost":
+        return xgb.XGBRegressor(random_state=42, n_jobs=-1, **(params or {}))
+    if name == "xgboost_log":
+        base = xgb.XGBRegressor(random_state=42, n_jobs=-1, **(params or {}))
+        return LogTargetRegressor(base)
     raise ValueError(f"Unknown model name: {name}")
+
+
+def sample_weight_by_rate(y: pd.Series) -> np.ndarray:
+    """#4 Sample weighting: weight each row proportionally to its own rate,
+    normalized so the average weight is 1.0 (keeps the overall loss scale
+    comparable to the unweighted case).
+
+    Why: the model's biggest dollar errors are on expensive, rare, long-haul
+    loads (found during error analysis) — those rows are a small fraction of
+    the data, so an unweighted loss lets the model mostly ignore them. Weighting
+    by rate forces getting the expensive loads right to matter as much as
+    getting the cheap, common ones right.
+    """
+    y = np.asarray(y, dtype=float)
+    return y / y.mean()
 
 
 # --- #2 Hyperparameter tuning -------------------------------------------------
@@ -108,10 +135,77 @@ def tune_gradient_boosting(
     return search.best_params_, search.best_score_
 
 
+XGB_PARAM_DISTRIBUTIONS = {
+    "n_estimators": [200, 300, 400, 600],
+    "learning_rate": [0.02, 0.05, 0.08, 0.1],
+    "max_depth": [3, 4, 5, 6],
+    "subsample": [0.7, 0.85, 1.0],
+    "colsample_bytree": [0.7, 0.85, 1.0],
+    "min_child_weight": [1, 5, 10, 20],
+}
+
+
+def tune_xgboost(
+    X_train: pd.DataFrame, y_train: pd.Series, log_target: bool = True, n_iter: int = 25
+) -> tuple[dict, float]:
+    """Same idea as tune_gradient_boosting: RandomizedSearchCV + TimeSeriesSplit
+    so tuning never validates on data from before its own training fold."""
+    base = xgb.XGBRegressor(random_state=42, n_jobs=-1)
+    estimator = LogTargetRegressor(base) if log_target else base
+    param_grid = (
+        {f"base_estimator__{k}": v for k, v in XGB_PARAM_DISTRIBUTIONS.items()}
+        if log_target
+        else XGB_PARAM_DISTRIBUTIONS
+    )
+
+    search = RandomizedSearchCV(
+        estimator=estimator,
+        param_distributions=param_grid,
+        n_iter=n_iter,
+        scoring="neg_mean_absolute_error",
+        cv=TimeSeriesSplit(n_splits=4),
+        random_state=42,
+        n_jobs=-1,
+    )
+    search.fit(X_train, y_train)
+    return search.best_params_, search.best_score_
+
+
+# --- #5 Time-based (rolling) cross-validation ---------------------------------
+
+
+def rolling_time_series_cv(
+    model_factory, df_sorted_by_date: pd.DataFrame, feature_cols: list[str], n_splits: int = 5
+) -> pd.DataFrame:
+    """Evaluate a model across several rolling train/holdout windows instead
+    of a single Sep-Oct split.
+
+    Why: one holdout split could be lucky or unlucky by chance. Repeating the
+    same time-respecting split multiple times (each fold's holdout is always
+    later than its training data) and averaging gives a trustworthy accuracy
+    number instead of a single roll of the dice.
+    """
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    rows = []
+    X = df_sorted_by_date[feature_cols]
+    y = df_sorted_by_date["posted_rate"]
+    for fold, (train_idx, val_idx) in enumerate(tscv.split(X), start=1):
+        model = model_factory()
+        model.fit(X.iloc[train_idx], y.iloc[train_idx])
+        preds = model.predict(X.iloc[val_idx])
+        metrics = evaluate(y.iloc[val_idx], preds)
+        metrics["fold"] = fold
+        metrics["train_rows"] = len(train_idx)
+        metrics["val_rows"] = len(val_idx)
+        rows.append(metrics)
+    return pd.DataFrame(rows).set_index("fold")
+
+
 def evaluate(y_true: pd.Series, y_pred: np.ndarray) -> dict:
     y_true = np.asarray(y_true)
     errors = y_pred - y_true
     mae = np.mean(np.abs(errors))
     rmse = np.sqrt(np.mean(errors**2))
     mape = np.mean(np.abs(errors / y_true)) * 100
-    return {"MAE": mae, "RMSE": rmse, "MAPE_%": mape}
+    r2 = r2_score(y_true, y_pred)
+    return {"MAE": mae, "RMSE": rmse, "MAPE_%": mape, "R2": r2}
